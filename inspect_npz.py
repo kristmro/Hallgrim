@@ -36,7 +36,23 @@ def moving_average(x: np.ndarray, window: int):
     return np.convolve(x, np.ones(w) / w, mode="same")
 
 
-def detect_steady_block_per_movement(t, z07, flap, movement_segments, dt):
+def infer_period_seconds_from_folder(npz_path: Path):
+    """Infer period (seconds) from folder name like p06, p155, p065, p105."""
+    folder = npz_path.parent.name.lower().strip()
+    if not folder.startswith("p"):
+        return None
+    token = folder[1:]
+    if not token.isdigit():
+        return None
+    if len(token) == 1:
+        return float(token)
+    if len(token) == 2:
+        return float(f"{token[0]}.{token[1]}")
+    # len >= 3: use first digit as integer part, rest as decimal part
+    return float(f"{token[0]}.{token[1:]}")
+
+
+def detect_steady_block_per_movement(t, z07, flap, movement_segments, dt, period_secs):
     """Return one steady block per movement section.
 
     Output rows: (movement_id, start_idx, end_idx, start_time, end_time, mean_z07)
@@ -44,19 +60,21 @@ def detect_steady_block_per_movement(t, z07, flap, movement_segments, dt):
     # Time settings (seconds)
     slope_window_secs = 0.6
     std_window_secs = 6.0
-    min_steady_secs = 10.0
+    min_steady_periods = 3.0
     post_peak_delay_secs = 2.0
     flap_progress_ratio = 0.85
 
     # Convert to samples
     slope_win = max(5, int(round(slope_window_secs / dt)))
     std_win = max(7, int(round(std_window_secs / dt)))
+    min_steady_secs = min_steady_periods * period_secs
     min_steady_samples = max(8, int(round(min_steady_secs / dt)))
     post_peak_delay_samples = max(0, int(round(post_peak_delay_secs / dt)))
 
     print(
-        f"Settings: slope_win={slope_window_secs:.1f}s, std_win={std_window_secs:.1f}s, "
-        f"min_steady={min_steady_secs:.1f}s, post_peak_delay={post_peak_delay_secs:.1f}s, "
+        f"Settings: period={period_secs:.3f}s, min_steady_periods={min_steady_periods:.2f}, "
+        f"min_steady={min_steady_secs:.3f}s, slope_win={slope_window_secs:.1f}s, "
+        f"std_win={std_window_secs:.1f}s, post_peak_delay={post_peak_delay_secs:.1f}s, "
         f"flap_progress_ratio={flap_progress_ratio:.2f}"
     )
 
@@ -219,7 +237,16 @@ def main():
         for i, (s, e) in enumerate(movement_segments, start=1):
             print(f" {i}: {s}-{e} ({t[e-1]-t[s]:.1f}s)")
 
-        steady_blocks = detect_steady_block_per_movement(t, z07, flap, movement_segments, dt)
+        period_secs = infer_period_seconds_from_folder(NPZ_PATH)
+        if period_secs is None:
+            period_secs = 1.0
+            print("Could not infer period from folder name; using default period=1.0s")
+        else:
+            print(f"Inferred period from folder '{NPZ_PATH.parent.name}': {period_secs:.3f}s")
+
+        steady_blocks = detect_steady_block_per_movement(
+            t, z07, flap, movement_segments, dt, period_secs
+        )
 
         if not steady_blocks:
             print("No steady-state blocks found.")
