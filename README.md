@@ -1,2 +1,0 @@
-# Hallgrim
-Helping Hallgrim 
