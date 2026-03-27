@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
-"""Inspect NPZ and detect one continuous steady-state block per flap movement segment."""
+"""Inspect NPZ data and detect steady-state z07 blocks during flap movement."""
 
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 
-# 1) Put your .npz path here.
 NPZ_PATH = Path(r"C:\Users\kmroe\Desktop\5 klasse\hallgrim\S1_30T06_16_R1_LANG_0102.npz")
 
 
-def _first_index(keys: np.ndarray, name: str) -> int | None:
-    matches = np.where(keys == name)[0]
-    return int(matches[0]) if len(matches) else None
+def first_index(keys: np.ndarray, name: str):
+    idx = np.where(keys == name)[0]
+    if len(idx) == 0:
+        return None
+    return int(idx[0])
 
 
-def _contiguous_true_blocks(mask: np.ndarray, min_len: int = 1) -> list[tuple[int, int]]:
-    blocks: list[tuple[int, int]] = []
+def contiguous_true_blocks(mask: np.ndarray, min_len: int = 1):
+    blocks = []
     start = None
     for i, flag in enumerate(mask):
         if flag and start is None:
@@ -30,132 +31,128 @@ def _contiguous_true_blocks(mask: np.ndarray, min_len: int = 1) -> list[tuple[in
     return blocks
 
 
-def _moving_average(x: np.ndarray, window: int) -> np.ndarray:
-    window = max(1, int(window))
-    kernel = np.ones(window, dtype=float) / window
-    return np.convolve(x, kernel, mode="same")
+def moving_average(x: np.ndarray, window: int):
+    w = max(1, int(window))
+    return np.convolve(x, np.ones(w) / w, mode="same")
 
 
-def detect_steady_block_per_movement(
-    t: np.ndarray,
-    z: np.ndarray,
-    flap: np.ndarray,
-    movement_segments: list[tuple[int, int]],
-    dt: float,
-) -> list[tuple[int, int, int, float, float, float]]:
-    """Return one continuous steady block per movement.
+def detect_steady_block_per_movement(t, z07, flap, movement_segments, dt):
+    """Return one steady block per movement section.
 
-    Returns tuples:
-        (movement_id, start_idx, end_idx, start_time, end_time, steady_mean)
+    Output rows: (movement_id, start_idx, end_idx, start_time, end_time, mean_z07)
     """
-    steady_blocks: list[tuple[int, int, int, float, float, float]] = []
-
-    # Settings in seconds; converted to sample counts with dt.
+    # Time settings (seconds)
     slope_window_secs = 0.6
     std_window_secs = 6.0
+    min_steady_secs = 10.0
+    post_peak_delay_secs = 2.0
     flap_progress_ratio = 0.85
+
+    # Convert to samples
+    slope_win = max(5, int(round(slope_window_secs / dt)))
+    std_win = max(7, int(round(std_window_secs / dt)))
+    min_steady_samples = max(8, int(round(min_steady_secs / dt)))
+    post_peak_delay_samples = max(0, int(round(post_peak_delay_secs / dt)))
+
     print(
-        "Steady-state settings: "
-        f"slope_window={slope_window_secs:.1f}s, "
-        f"std_window={std_window_secs:.1f}s, "
-        f"min_steady={min_steady_secs:.1f}s, "
-        f"post_peak_delay={post_peak_delay_secs:.1f}s, "
-        f"flap_progress_ratio={flap_progress_ratio:.2f} "
-        "(converted to samples using dt)."
+        f"Settings: slope_win={slope_window_secs:.1f}s, std_win={std_window_secs:.1f}s, "
+        f"min_steady={min_steady_secs:.1f}s, post_peak_delay={post_peak_delay_secs:.1f}s, "
+        f"flap_progress_ratio={flap_progress_ratio:.2f}"
     )
 
-        detrended = seg_z - _moving_average(seg_z, slope_win)
-        std_metric = np.sqrt(_moving_average(detrended**2, std_win))
-        flap_hit = np.where(flap_delta >= flap_target)[0]
-        flap_gate = int(flap_hit[0]) if len(flap_hit) else 0
-
-        f"std_window={std_window_secs:.1f}s, "
-        f"min_steady={min_steady_secs:.1f}s "
-        "(converted to samples using dt)."
-    )
+    out = []
 
     for move_id, (ms, me) in enumerate(movement_segments, start=1):
         seg_t = t[ms:me]
-        seg_z = z[ms:me]
-        n = len(seg_z)
-        if n < max(std_win, min_steady):
-            print(f" Movement {move_id} too short for steady detection.")
+        seg_z = z07[ms:me]
+        seg_flap = flap[ms:me]
+
+        if len(seg_z) < max(std_win, min_steady_samples):
+            print(f"Movement {move_id}: too short")
             continue
 
-        dz = np.gradient(seg_z, seg_t)
-        slope_metric = _moving_average(np.abs(dz), slope_win)
-        std_metric = np.sqrt(_moving_average((seg_z - _moving_average(seg_z, slope_win)) ** 2, std_win))
+        dzdt = np.gradient(seg_z, seg_t)
+        slope_metric = moving_average(np.abs(dzdt), slope_win)
+        detrended = seg_z - moving_average(seg_z, slope_win)
+        std_metric = np.sqrt(moving_average(detrended**2, std_win))
 
-        # Adaptive thresholds per movement segment.
-        slope_thr = np.nanquantile(slope_metric, 0.40)
-        std_thr = np.nanquantile(std_metric, 0.35)
+        # Gate 1: after major z07 response peak
+        baseline = float(np.median(seg_z))
+        peak_idx = int(np.argmax(np.abs(seg_z - baseline)))
+        gate_peak = min(len(seg_z) - 1, peak_idx + post_peak_delay_samples)
 
-        candidate = (slope_metric <= slope_thr) & (std_metric <= std_thr)
-        blocks = _contiguous_true_blocks(candidate, min_len=min_steady)
+        # Gate 2: after flap reaches most of its step
+        flap_delta = np.abs(seg_flap - float(seg_flap[0]))
+        flap_target = flap_progress_ratio * float(np.max(flap_delta))
+        flap_hit = np.where(flap_delta >= flap_target)[0]
+        gate_flap = int(flap_hit[0]) if len(flap_hit) > 0 else 0
+
+        search_start = max(gate_peak, gate_flap)
+
+        tail_slope = slope_metric[search_start:]
+        tail_std = std_metric[search_start:]
+        if len(tail_slope) < min_steady_samples:
+            print(f"Movement {move_id}: not enough post-gate points")
+            continue
+
+        slope_thr = float(np.nanquantile(tail_slope, 0.55))
+        std_thr = float(np.nanquantile(tail_std, 0.50))
+
+        steady_mask = (slope_metric <= slope_thr) & (std_metric <= std_thr)
+        steady_mask[:search_start] = False
+
+        blocks = contiguous_true_blocks(steady_mask, min_len=min_steady_samples)
         if not blocks:
-            print(f" Movement {move_id}: no steady block (try relaxing thresholds).")
+            print(f"Movement {move_id}: no steady block")
             continue
 
-        # Pick a single continuous block per movement: prefer the latest one in the segment.
-        best_start, best_end = max(blocks, key=lambda b: (b[1], b[1] - b[0]))
+        # Choose latest (later in movement) and then longest.
+        best_start, best_end = max(blocks, key=lambda b: (b[0], b[1] - b[0]))
 
-        g_start = ms + best_start
-        g_end = ms + best_end
-        steady_mean = float(np.mean(z[g_start:g_end]))
-        steady_blocks.append((move_id, g_start, g_end, t[g_start], t[g_end - 1], steady_mean))
+        gs = ms + best_start
+        ge = ms + best_end
+        mean_val = float(np.mean(z07[gs:ge]))
+        out.append((move_id, gs, ge, t[gs], t[ge - 1], mean_val))
 
-    return steady_blocks
+    return out
 
 
-def main() -> None:
-    npz_file = NPZ_PATH
-    if not npz_file.exists():
-        print(f"NPZ file not found: {npz_file}")
-        print("Edit NPZ_PATH in inspect_npz.py and run again.")
+def main():
+    if not NPZ_PATH.exists():
+        print(f"NPZ file not found: {NPZ_PATH}")
+        print("Edit NPZ_PATH and run again.")
         return
 
-    with np.load(npz_file, allow_pickle=True) as archive:
-        print(f"Loaded: {npz_file}")
-
+    with np.load(NPZ_PATH, allow_pickle=True) as archive:
         keys = archive["keys"]
         if keys.dtype.kind in {"S", "O"}:
             keys = np.array([k.decode() if isinstance(k, bytes) else str(k) for k in keys])
 
-        data_obj = archive["data"].item() if archive["data"].shape == () else archive["data"]
+        data = archive["data"].item() if archive["data"].shape == () else archive["data"]
 
-        want_names = [
-            "Time  1 - default sample rate",
-            "z07",
-            "WP1",
-            "Flap_position",
-        ]
+        required = {
+            "Time  1 - default sample rate": None,
+            "z07": None,
+            "WP1": None,
+            "Flap_position": None,
+        }
 
-        print("\nSelected series")
-        for name in want_names:
-            idx = _first_index(keys, name)
-            if idx is None:
-                print(f"- {name}: NOT FOUND")
-                continue
-            series = np.asarray(data_obj[idx])
-            print(f"- {name}: index {idx}, shape={series.shape}, dtype={series.dtype}")
-            print(f"  sample [first 5] = {series[:5]}")
+        print("Loaded:", NPZ_PATH)
+        for k in required:
+            required[k] = first_index(keys, k)
+            if required[k] is None:
+                print(f"Missing key: {k}")
 
-        print("\nFull key legend count", len(keys))
-
-        idx_t = _first_index(keys, "Time  1 - default sample rate")
-        idx_z = _first_index(keys, "z07")
-        idx_w = _first_index(keys, "WP1")
-        idx_f = _first_index(keys, "Flap_position")
-
-        if None in [idx_t, idx_z, idx_w, idx_f]:
-            print("One or more required keys missing for plotting")
+        if any(required[k] is None for k in required):
+            print("One or more required keys missing.")
             return
 
-        t = np.asarray(data_obj[idx_t], dtype=float)
-        z07 = np.asarray(data_obj[idx_z], dtype=float)
-        wp1 = np.asarray(data_obj[idx_w], dtype=float) * 1000.0
-        flap = np.asarray(data_obj[idx_f], dtype=float)
+        t = np.asarray(data[required["Time  1 - default sample rate"]], dtype=float)
+        z07 = np.asarray(data[required["z07"]], dtype=float)
+        wp1 = np.asarray(data[required["WP1"]], dtype=float) * 1000.0
+        flap = np.asarray(data[required["Flap_position"]], dtype=float)
 
+        # Overview plot
         plt.figure(figsize=(11, 6))
         plt.plot(t, flap, label="Flap_position", linewidth=1)
         plt.plot(t, wp1, label="WP1 (x1000 mm)", linewidth=1)
@@ -168,66 +165,65 @@ def main() -> None:
         plt.tight_layout()
         plt.show()
 
+        # Flat flap detection
         dt = np.median(np.diff(t)) if len(t) > 1 else 1.0
         min_flat_secs = 180.0
         min_flat_samples = max(1, int(np.ceil(min_flat_secs / dt)))
         flat_thresh = 0.02
 
-        diff = np.abs(np.diff(flap, prepend=flap[0]))
-        flat_mask = diff <= flat_thresh
+        flap_diff = np.abs(np.diff(flap, prepend=flap[0]))
+        flat_mask = flap_diff <= flat_thresh
         flat_segments = []
-        for s, e in _contiguous_true_blocks(flat_mask, min_len=min_flat_samples):
+        for s, e in contiguous_true_blocks(flat_mask, min_len=min_flat_samples):
             flat_segments.append((s, e, t[e - 1] - t[s]))
 
         if not flat_segments:
-            print("No flat flap segment ~3 min found (threshold/min duration may need tuning)")
+            print("No flat flap segments found. Tune thresholds.")
             return
 
-        print("\nDetected flat flap segments (index range, duration sec):")
+        print("\nFlat flap segments:")
         for i, (s, e, dur) in enumerate(flat_segments, start=1):
-            print(f" {i}: {s}-{e} -> {dur:.1f}s (~{dur / 60:.1f}min)")
+            print(f" {i}: {s}-{e} ({dur:.1f}s)")
 
+        # Movement segments = gaps between flat segments
         movement_segments = []
         last_end = 0
-        for (s, e, _) in flat_segments:
+        for s, e, _ in flat_segments:
             if last_end < s:
                 movement_segments.append((last_end, s))
             last_end = e
         if last_end < len(t):
             movement_segments.append((last_end, len(t)))
 
-        print("\nMovement segments (non-flat) for steady-state detection:")
-        for i, (ms, me) in enumerate(movement_segments, start=1):
-            duration = t[me - 1] - t[ms]
-            print(f" {i}: {ms}-{me} -> {duration:.1f}s")
+        print("\nMovement segments:")
+        for i, (s, e) in enumerate(movement_segments, start=1):
+            print(f" {i}: {s}-{e} ({t[e-1]-t[s]:.1f}s)")
 
         steady_blocks = detect_steady_block_per_movement(t, z07, flap, movement_segments, dt)
 
         if not steady_blocks:
-            print("No steady-state segments found during movement intervals.")
+            print("No steady-state blocks found.")
             return
 
-        print("\nDetected steady-state block per movement:")
-        for idx, bs, be, bt0, bt1, mean_v in steady_blocks:
-            print(
-                f" movement {idx}: global {bs}-{be}, time {bt0:.2f}-{bt1:.2f}, "
-                f"duration {bt1 - bt0:.1f}s, mean {mean_v:.3f}"
-            )
+        print("\nDetected steady-state blocks:")
+        for m_id, s, e, t0, t1, mean_z in steady_blocks:
+            print(f" movement {m_id}: idx {s}-{e}, time {t0:.2f}-{t1:.2f}, dur {t1-t0:.1f}s, mean {mean_z:.3f}")
 
+        # Final plot
         fig, ax1 = plt.subplots(figsize=(14, 6))
         ax2 = ax1.twinx()
 
-        ax1.plot(t, z07, label="z07", linewidth=1, color="tab:blue")
-        ax2.plot(t, flap, label="Flap_position", linewidth=1, color="tab:orange", alpha=0.7)
+        ax1.plot(t, z07, color="tab:blue", linewidth=1, label="z07")
+        ax2.plot(t, flap, color="tab:orange", linewidth=1, alpha=0.7, label="Flap_position")
 
-        for _, start_i, end_i, start_t, end_t, mean_v in steady_blocks:
-            ax1.axvspan(start_t, end_t, color="yellow", alpha=0.25)
-            ax1.hlines(mean_v, start_t, end_t, color="red", linewidth=2, linestyle="--")
+        for _, s, e, t0, t1, mean_z in steady_blocks:
+            ax1.axvspan(t0, t1, color="yellow", alpha=0.25)
+            ax1.hlines(mean_z, t0, t1, color="red", linestyle="--", linewidth=2)
 
         ax1.set_xlabel("Time")
         ax1.set_ylabel("z07", color="tab:blue")
-        ax2.set_ylabel("Flap_position", color="tab:orange")
-        ax1.set_title("z07 steady-state (one continuous block per flap movement)")
+        ax2.set_ylabel("Flap position", color="tab:orange")
+        ax1.set_title("z07 steady-state (one block per movement)")
         ax1.grid(True, alpha=0.3)
 
         lines1, labels1 = ax1.get_legend_handles_labels()
