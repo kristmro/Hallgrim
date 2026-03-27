@@ -50,24 +50,25 @@ def detect_steady_block_per_movement(
     """
     steady_blocks: list[tuple[int, int, int, float, float, float]] = []
 
-    # Window and duration settings in seconds (converted to samples using dt).
+    # Settings in seconds; converted to sample counts with dt.
     slope_window_secs = 0.6
     std_window_secs = 6.0
     flap_progress_ratio = 0.85
-    settings_msg = f"Steady-state settings: slope_window={slope_window_secs:.1f}s, std_window={std_window_secs:.1f}s, min_steady={min_steady_secs:.1f}s, post_peak_delay={post_peak_delay_secs:.1f}s, flap_progress_ratio={flap_progress_ratio:.2f} (converted to samples using dt)."
-        flap_target = flap_progress_ratio * float(np.max(flap_delta))
-        flap_candidates = np.where(flap_delta >= flap_target)[0]
-        flap_gate = int(flap_candidates[0]) if len(flap_candidates) else 0
-
-        search_start = max(peak_gate, flap_gate)
-
-    slope_win = max(5, int(round(slope_window_secs / dt)))
-    std_win = max(7, int(round(std_window_secs / dt)))
-    min_steady = max(8, int(round(min_steady_secs / dt)))
-
     print(
         "Steady-state settings: "
         f"slope_window={slope_window_secs:.1f}s, "
+        f"std_window={std_window_secs:.1f}s, "
+        f"min_steady={min_steady_secs:.1f}s, "
+        f"post_peak_delay={post_peak_delay_secs:.1f}s, "
+        f"flap_progress_ratio={flap_progress_ratio:.2f} "
+        "(converted to samples using dt)."
+    )
+
+        detrended = seg_z - _moving_average(seg_z, slope_win)
+        std_metric = np.sqrt(_moving_average(detrended**2, std_win))
+        flap_hit = np.where(flap_delta >= flap_target)[0]
+        flap_gate = int(flap_hit[0]) if len(flap_hit) else 0
+
         f"std_window={std_window_secs:.1f}s, "
         f"min_steady={min_steady_secs:.1f}s "
         "(converted to samples using dt)."
