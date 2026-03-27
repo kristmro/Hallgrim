@@ -36,20 +36,46 @@ def moving_average(x: np.ndarray, window: int):
     return np.convolve(x, np.ones(w) / w, mode="same")
 
 
-def infer_period_seconds_from_folder(npz_path: Path):
-    """Infer period (seconds) from folder name like p06, p155, p065, p105."""
-    folder = npz_path.parent.name.lower().strip()
-    if not folder.startswith("p"):
+def infer_period_seconds_from_flap(t, flap, movement_segments, dt):
+    """Infer oscillation period directly from flap signal during movement sections."""
+    if len(movement_segments) == 0:
         return None
-    token = folder[1:]
-    if not token.isdigit():
+
+    mask = np.zeros(len(flap), dtype=bool)
+    for s, e in movement_segments:
+        mask[s:e] = True
+
+    tm = t[mask]
+    xm = flap[mask]
+    if len(xm) < 10:
         return None
-    if len(token) == 1:
-        return float(token)
-    if len(token) == 2:
-        return float(f"{token[0]}.{token[1]}")
-    # len >= 3: use first digit as integer part, rest as decimal part
-    return float(f"{token[0]}.{token[1:]}")
+
+    # Smooth lightly before peak detection.
+    smooth_win = max(3, int(round(0.05 / dt)))
+    xs = moving_average(xm, smooth_win)
+
+    # Simple local maxima.
+    peaks = np.where((xs[1:-1] > xs[:-2]) & (xs[1:-1] >= xs[2:]))[0] + 1
+    if len(peaks) >= 4:
+        peak_periods = np.diff(tm[peaks])
+        peak_periods = peak_periods[peak_periods > 0]
+        if len(peak_periods) > 0:
+            return float(np.median(peak_periods))
+
+    # Fallback to dominant frequency via FFT.
+    x0 = xm - np.mean(xm)
+    if np.allclose(x0, 0.0):
+        return None
+
+    freqs = np.fft.rfftfreq(len(x0), d=dt)
+    power = np.abs(np.fft.rfft(x0)) ** 2
+    valid = (freqs > 0.05) & (freqs < 10.0)
+    if not np.any(valid):
+        return None
+    f_dom = freqs[valid][np.argmax(power[valid])]
+    if f_dom <= 0:
+        return None
+    return float(1.0 / f_dom)
 
 
 def detect_steady_block_per_movement(t, z07, flap, movement_segments, dt, period_secs):
@@ -237,12 +263,12 @@ def main():
         for i, (s, e) in enumerate(movement_segments, start=1):
             print(f" {i}: {s}-{e} ({t[e-1]-t[s]:.1f}s)")
 
-        period_secs = infer_period_seconds_from_folder(NPZ_PATH)
+        period_secs = infer_period_seconds_from_flap(t, flap, movement_segments, dt)
         if period_secs is None:
             period_secs = 1.0
-            print("Could not infer period from folder name; using default period=1.0s")
+            print("Could not infer period from flap signal; using default period=1.0s")
         else:
-            print(f"Inferred period from folder '{NPZ_PATH.parent.name}': {period_secs:.3f}s")
+            print(f"Inferred period from flap signal: {period_secs:.3f}s")
 
         steady_blocks = detect_steady_block_per_movement(
             t, z07, flap, movement_segments, dt, period_secs
