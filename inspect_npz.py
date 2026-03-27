@@ -54,11 +54,11 @@ def detect_steady_block_per_movement(
     slope_window_secs = 0.6
     std_window_secs = 6.0
     flap_progress_ratio = 0.85
-        f"flap_progress_ratio={flap_progress_ratio:.2f} "
-        seg_flap = flap[ms:me]
-        peak_gate = min(n - 1, peak_idx + post_peak_delay)
-
-        # Additional gate: only allow detection after flap has reached most of
+    settings_msg = (
+        f"Steady-state settings: slope_window={slope_window_secs:.1f}s, "
+        f"min_steady={min_steady_secs:.1f}s, "
+        f"post_peak_delay={post_peak_delay_secs:.1f}s, "
+    print(settings_msg)
         # the step amplitude (helps avoid selecting too early in each step).
         flap_start = float(seg_flap[0])
         flap_delta = np.abs(seg_flap - flap_start)
