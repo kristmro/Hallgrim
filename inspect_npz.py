@@ -39,6 +39,7 @@ def _moving_average(x: np.ndarray, window: int) -> np.ndarray:
 def detect_steady_block_per_movement(
     t: np.ndarray,
     z: np.ndarray,
+    flap: np.ndarray,
     movement_segments: list[tuple[int, int]],
     dt: float,
 ) -> list[tuple[int, int, int, float, float, float]]:
@@ -52,7 +53,20 @@ def detect_steady_block_per_movement(
     # Window and duration settings in seconds (converted to samples using dt).
     slope_window_secs = 0.6
     std_window_secs = 6.0
-    min_steady_secs = 8.0
+    flap_progress_ratio = 0.85
+        f"flap_progress_ratio={flap_progress_ratio:.2f} "
+        seg_flap = flap[ms:me]
+        peak_gate = min(n - 1, peak_idx + post_peak_delay)
+
+        # Additional gate: only allow detection after flap has reached most of
+        # the step amplitude (helps avoid selecting too early in each step).
+        flap_start = float(seg_flap[0])
+        flap_delta = np.abs(seg_flap - flap_start)
+        flap_target = flap_progress_ratio * float(np.max(flap_delta))
+        flap_candidates = np.where(flap_delta >= flap_target)[0]
+        flap_gate = int(flap_candidates[0]) if len(flap_candidates) else 0
+
+        search_start = max(peak_gate, flap_gate)
 
     slope_win = max(5, int(round(slope_window_secs / dt)))
     std_win = max(7, int(round(std_window_secs / dt)))
@@ -193,7 +207,7 @@ def main() -> None:
             duration = t[me - 1] - t[ms]
             print(f" {i}: {ms}-{me} -> {duration:.1f}s")
 
-        steady_blocks = detect_steady_block_per_movement(t, z07, movement_segments, dt)
+        steady_blocks = detect_steady_block_per_movement(t, z07, flap, movement_segments, dt)
 
         if not steady_blocks:
             print("No steady-state segments found during movement intervals.")
