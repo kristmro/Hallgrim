@@ -36,36 +36,101 @@ def moving_average(x: np.ndarray, window: int):
     return np.convolve(x, np.ones(w) / w, mode="same")
 
 
+def infer_period_seconds_from_segment(seg_t, seg_flap, dt):
+    """Infer oscillation period from one movement segment."""
+    if len(seg_flap) < 10:
+        return None
+
+    # Smooth lightly before peak detection.
+    smooth_win = max(3, int(round(0.05 / dt)))
+    xs = moving_average(seg_flap, smooth_win)
+
+    # Simple local maxima.
+    peaks = np.where((xs[1:-1] > xs[:-2]) & (xs[1:-1] >= xs[2:]))[0] + 1
+    if len(peaks) >= 4:
+        peak_periods = np.diff(seg_t[peaks])
+        peak_periods = peak_periods[peak_periods > 0]
+        if len(peak_periods) > 0:
+            return float(np.median(peak_periods))
+
+    # Fallback to dominant frequency via FFT.
+    x0 = seg_flap - np.mean(seg_flap)
+    if np.allclose(x0, 0.0):
+        return None
+
+    freqs = np.fft.rfftfreq(len(x0), d=dt)
+    power = np.abs(np.fft.rfft(x0)) ** 2
+    valid = (freqs > 0.05) & (freqs < 10.0)
+    if not np.any(valid):
+        return None
+    f_dom = freqs[valid][np.argmax(power[valid])]
+    if f_dom <= 0:
+        return None
+    return float(1.0 / f_dom)
+
+
 def detect_steady_block_per_movement(t, z07, flap, movement_segments, dt):
     """Return one steady block per movement section.
 
-    Output rows: (movement_id, start_idx, end_idx, start_time, end_time, mean_z07)
+    Output rows:
+    (movement_id, start_idx, end_idx, start_time, end_time, mean_z07, period_secs, search_start_idx, search_end_idx)
     """
     # Time settings (seconds)
-    slope_window_secs = 0.6
+    slope_window_secs = 3
     std_window_secs = 6.0
-    min_steady_secs = 10.0
-    post_peak_delay_secs = 2.0
-    flap_progress_ratio = 0.85
+    min_steady_periods = 10.0
+    ignore_front_seconds = 35.0
+    ignore_back_seconds = 50.0
 
-    # Convert to samples
+    # Convert static windows to samples.
     slope_win = max(5, int(round(slope_window_secs / dt)))
     std_win = max(7, int(round(std_window_secs / dt)))
-    min_steady_samples = max(8, int(round(min_steady_secs / dt)))
-    post_peak_delay_samples = max(0, int(round(post_peak_delay_secs / dt)))
 
     print(
-        f"Settings: slope_win={slope_window_secs:.1f}s, std_win={std_window_secs:.1f}s, "
-        f"min_steady={min_steady_secs:.1f}s, post_peak_delay={post_peak_delay_secs:.1f}s, "
-        f"flap_progress_ratio={flap_progress_ratio:.2f}"
+        f"Settings: per-segment period inference enabled, min_steady_periods={min_steady_periods:.2f}, "
+        f"slope_win={slope_window_secs:.1f}s, "
+        f"std_win={std_window_secs:.1f}s, "
+        f"ignore_front_seconds={ignore_front_seconds:.2f}s, "
+        f"ignore_back_seconds={ignore_back_seconds:.2f}s"
     )
 
     out = []
+    period_history = []
 
     for move_id, (ms, me) in enumerate(movement_segments, start=1):
         seg_t = t[ms:me]
         seg_z = z07[ms:me]
         seg_flap = flap[ms:me]
+
+        raw_period = infer_period_seconds_from_segment(seg_t, seg_flap, dt)
+        period_secs = raw_period
+
+        # Guard against noisy or unrealistic period estimates.
+        valid_period = period_secs is not None and 0.30 <= period_secs <= 3.00
+        if not valid_period:
+            if period_history:
+                period_secs = float(np.median(period_history[-5:]))
+                print(
+                    f"Movement {move_id}: raw period={raw_period} out of range, "
+                    f"using recent median={period_secs:.3f}s"
+                )
+            else:
+                period_secs = 1.0
+                print(f"Movement {move_id}: period inference failed, using default 1.0s")
+        else:
+            period_history.append(period_secs)
+
+        min_steady_secs = min_steady_periods * period_secs
+        min_steady_samples = max(8, int(round(min_steady_secs / dt)))
+        ignore_front_samples = max(0, int(round(ignore_front_seconds / dt)))
+        ignore_back_samples = max(0, int(round(ignore_back_seconds / dt)))
+        print(
+            f"Movement {move_id}: inferred period={period_secs:.3f}s "
+            f"(raw={raw_period}), "
+            f"min_steady={min_steady_secs:.3f}s, "
+            f"ignore_front={ignore_front_seconds:.3f}s, "
+            f"ignore_back={ignore_back_seconds:.3f}s"
+        )
 
         if len(seg_z) < max(std_win, min_steady_samples):
             print(f"Movement {move_id}: too short")
@@ -76,21 +141,18 @@ def detect_steady_block_per_movement(t, z07, flap, movement_segments, dt):
         detrended = seg_z - moving_average(seg_z, slope_win)
         std_metric = np.sqrt(moving_average(detrended**2, std_win))
 
-        # Gate 1: after major z07 response peak
-        baseline = float(np.median(seg_z))
-        peak_idx = int(np.argmax(np.abs(seg_z - baseline)))
-        gate_peak = min(len(seg_z) - 1, peak_idx + post_peak_delay_samples)
+        # Fixed-size search window controlled only by front/back ignore seconds.
+        search_start = ignore_front_samples
+        search_end = len(seg_z) - ignore_back_samples
+        if search_end <= search_start:
+            print(f"Movement {move_id}: invalid search window (front/back ignore too large)")
+            continue
+        if (search_end - search_start) < min_steady_samples:
+            print(f"Movement {move_id}: search window shorter than min steady duration")
+            continue
 
-        # Gate 2: after flap reaches most of its step
-        flap_delta = np.abs(seg_flap - float(seg_flap[0]))
-        flap_target = flap_progress_ratio * float(np.max(flap_delta))
-        flap_hit = np.where(flap_delta >= flap_target)[0]
-        gate_flap = int(flap_hit[0]) if len(flap_hit) > 0 else 0
-
-        search_start = max(gate_peak, gate_flap)
-
-        tail_slope = slope_metric[search_start:]
-        tail_std = std_metric[search_start:]
+        tail_slope = slope_metric[search_start:search_end]
+        tail_std = std_metric[search_start:search_end]
         if len(tail_slope) < min_steady_samples:
             print(f"Movement {move_id}: not enough post-gate points")
             continue
@@ -101,6 +163,7 @@ def detect_steady_block_per_movement(t, z07, flap, movement_segments, dt):
 
         steady_mask = (slope_metric <= slope_thr) & (std_metric <= std_thr)
         steady_mask[:search_start] = False
+        steady_mask[search_end:] = False
 
         blocks = contiguous_true_blocks(steady_mask, min_len=min_steady_samples)
 
@@ -132,9 +195,51 @@ def detect_steady_block_per_movement(t, z07, flap, movement_segments, dt):
         gs = ms + best_start
         ge = ms + best_end
         mean_val = float(np.mean(z07[gs:ge]))
-        out.append((move_id, gs, ge, t[gs], t[ge - 1], mean_val))
+        search_start_global = ms + search_start
+        search_end_global = ms + search_end
+        out.append(
+            (
+                move_id,
+                gs,
+                ge,
+                t[gs],
+                t[ge - 1],
+                mean_val,
+                period_secs,
+                search_start_global,
+                search_end_global,
+            )
+        )
 
     return out
+
+
+def plot_movement_segments(t, z07, flap, movement_segments, figsize=(12, 4)):
+    import matplotlib.pyplot as plt
+    import numpy as _np
+
+    plt.figure(figsize=figsize)
+    plt.plot(t, z07, label="z07 (mm)", color="C0")
+    plt.plot(t, flap, label="Flap_position (mm)", color="C1", alpha=0.9)
+
+    try:
+        ymax = float(_np.nanmax(z07))
+        ymin = float(_np.nanmin(z07))
+    except Exception:
+        ymax, ymin = 1.0, 0.0
+    yr = ymax - ymin if ymax != ymin else max(1.0, abs(ymax) * 0.1)
+
+    for i, (s, e) in enumerate(movement_segments, start=1):
+        t0 = float(t[s]) if s < len(t) else float(t[-1])
+        t1 = float(t[e - 1]) if (e - 1) < len(t) else float(t[-1])
+        plt.axvspan(t0, t1, color="orange", alpha=0.25)
+        plt.vlines([t0, t1], ymin, ymax, color="k", linestyle="--", linewidth=0.8)
+        plt.text((t0 + t1) / 2, ymax - 0.05 * yr, f"mov{i}", ha="center", va="top", fontsize=8)
+
+    plt.xlabel("time (s)")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
 
 
 def main():
@@ -205,51 +310,61 @@ def main():
         for i, (s, e, dur) in enumerate(flat_segments, start=1):
             print(f" {i}: {s}-{e} ({dur:.1f}s)")
 
-        # Movement segments = gaps between flat segments
+        # Movement segments between flat segments, plus an optional first
+        # pre-flat movement segment if movement exists before first flat block.
         movement_segments = []
-        last_end = 0
-        for s, e, _ in flat_segments:
-            if last_end < s:
-                movement_segments.append((last_end, s))
-            last_end = e
-        if last_end < len(t):
-            movement_segments.append((last_end, len(t)))
+
+        first_flat_start = flat_segments[0][0]
+        pre_first_move_idx = np.where(flap_diff[:first_flat_start] > flat_thresh)[0]
+        if len(pre_first_move_idx) > 0:
+            pre_start = int(pre_first_move_idx[0])
+            if pre_start < first_flat_start:
+                movement_segments.append((pre_start, first_flat_start))
+
+        for i in range(len(flat_segments) - 1):
+            prev_end = flat_segments[i][1]
+            next_start = flat_segments[i + 1][0]
+            if prev_end < next_start:
+                movement_segments.append((prev_end, next_start))
 
         print("\nMovement segments:")
         for i, (s, e) in enumerate(movement_segments, start=1):
             print(f" {i}: {s}-{e} ({t[e-1]-t[s]:.1f}s)")
 
-        steady_blocks = detect_steady_block_per_movement(t, z07, flap, movement_segments, dt)
+        steady_blocks = detect_steady_block_per_movement(
+            t, z07, flap, movement_segments, dt
+        )
 
         if not steady_blocks:
             print("No steady-state blocks found.")
             return
 
         print("\nDetected steady-state blocks:")
-        for m_id, s, e, t0, t1, mean_z in steady_blocks:
-            print(f" movement {m_id}: idx {s}-{e}, time {t0:.2f}-{t1:.2f}, dur {t1-t0:.1f}s, mean {mean_z:.3f}")
+        for m_id, s, e, t0, t1, mean_z, period_s, ss_gs, ss_ge in steady_blocks:
+            print(
+                f" movement {m_id}: idx {s}-{e}, time {t0:.2f}-{t1:.2f}, "
+                f"dur {t1-t0:.1f}s, mean {mean_z:.3f}, period {period_s:.3f}s"
+            )
 
         # Final plot
-        fig, ax1 = plt.subplots(figsize=(14, 6))
-        ax2 = ax1.twinx()
+        try:
+            plot_movement_segments(t, z07, flap, movement_segments)
+        except Exception as _ex:
+            print(f"plot_movement_segments failed: {_ex}")
 
-        ax1.plot(t, z07, color="tab:blue", linewidth=1, label="z07")
-        ax2.plot(t, flap, color="tab:orange", linewidth=1, alpha=0.7, label="Flap_position")
-
-        for _, s, e, t0, t1, mean_z in steady_blocks:
-            ax1.axvspan(t0, t1, color="yellow", alpha=0.25)
-            ax1.hlines(mean_z, t0, t1, color="red", linestyle="--", linewidth=2)
-
-        ax1.set_xlabel("Time")
-        ax1.set_ylabel("z07", color="tab:blue")
-        ax2.set_ylabel("Flap position", color="tab:orange")
-        ax1.set_title("z07 steady-state (one block per movement)")
-        ax1.grid(True, alpha=0.3)
-
-        lines1, labels1 = ax1.get_legend_handles_labels()
-        lines2, labels2 = ax2.get_legend_handles_labels()
-        ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper left")
-
+        # Additional plot: period and steady-state selections together.
+        fig2, axp = plt.subplots(figsize=(14, 5))
+        axp.plot(t, z07, color="tab:blue", lw=1, label="z07")
+        for m_id, s, e, t0, t1, mean_z, period_s, ss_gs, ss_ge in steady_blocks:
+            axp.axvspan(t[ss_gs], t[ss_ge - 1], color="tab:green", alpha=0.08)
+            axp.axvspan(t0, t1, color="yellow", alpha=0.28)
+            axp.hlines(mean_z, t0, t1, color="red", lw=2, linestyles="--")
+            axp.text((t0 + t1) / 2, mean_z, f"M{m_id} P={period_s:.2f}s", fontsize=7, ha="center")
+        axp.set_title("Per-movement period + selected steady-state window")
+        axp.set_xlabel("Time")
+        axp.set_ylabel("z07")
+        axp.grid(True, alpha=0.25)
+        axp.legend(loc="upper right")
         plt.tight_layout()
         plt.show()
 
